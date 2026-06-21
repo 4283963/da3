@@ -33,3 +33,11 @@ bin/
 obj/
 __pycache__/
 *.pyc
+
+# Python 虚拟环境
+.venv/
+venv/
+env/
+
+# 环境变量与密钥
+.env

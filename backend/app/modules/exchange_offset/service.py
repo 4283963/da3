@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import random
+import time
 from datetime import date
 from decimal import ROUND_HALF_UP, Decimal
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.models.contract import Contract, Currency
 from app.models.deduction import Deduction
 from app.models.exchange_offset import ExchangeOffset
@@ -25,7 +28,8 @@ BASE_RATES: dict[Currency, Decimal] = {
     Currency.USD: Decimal("7.200000"),
     Currency.THB: Decimal("0.200000"),
 }
-FLUCTUATION = Decimal("0.015")
+
+log = logging.getLogger(__name__)
 
 
 def _seed(currency: Currency, rate_date: date) -> int:
@@ -42,31 +46,142 @@ def simulate_rate(
     return (base * (Decimal("1") + delta)).quantize(RATE_PRECISION)
 
 
+def _inverse_rate(cny_per_x: Decimal) -> Decimal:
+    if cny_per_x <= 0:
+        raise ValueError("非正汇率不可用")
+    return (Decimal("1") / cny_per_x).quantize(RATE_PRECISION)
+
+
+def fetch_live_rates_via_http() -> dict[Currency, Decimal] | None:
+    """
+    调真实的国际汇率接口。返回 {币种: 1 外币兑换多少 CNY}。
+    网络 / 超时 / HTTP 错一律捕获并返回 None，让上层 fallback 到本地模拟。
+    """
+    try:
+        import requests
+    except Exception as exc:  # pragma: no cover - 极端依赖缺失情况
+        log.warning("requests 库不可用，跳过在线汇率: %s", exc)
+        return None
+
+    timeout = settings.exchange_rate_timeout
+    max_retries = max(1, settings.exchange_rate_max_retries)
+    backoff = settings.exchange_rate_backoff
+    last_error: Exception | None = None
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = requests.get(
+                settings.exchange_rate_api_url,
+                timeout=timeout,
+                headers={"Accept": "application/json"},
+            )
+            response.raise_for_status()
+            payload = response.json()
+            rates = payload.get("rates") or {}
+            base = (payload.get("base") or "CNY").upper()
+
+            if base == "CNY":
+                raw_usd = rates.get(Currency.USD.value)
+                raw_thb = rates.get(Currency.THB.value)
+                if raw_usd is None or raw_thb is None:
+                    raise ValueError("返回的汇率缺少 USD/THB 字段")
+                return {
+                    Currency.USD: _inverse_rate(Decimal(str(raw_usd))),
+                    Currency.THB: _inverse_rate(Decimal(str(raw_thb))),
+                }
+
+            if base == "USD":
+                raw_cny = rates.get("CNY")
+                raw_thb = rates.get(Currency.THB.value)
+                if raw_cny is None or raw_thb is None:
+                    raise ValueError("返回的汇率缺少 CNY/THB 字段")
+                usd_cny = Decimal(str(raw_cny)).quantize(RATE_PRECISION)
+                thb_cny = (usd_cny / Decimal(str(raw_thb))).quantize(RATE_PRECISION)
+                return {Currency.USD: usd_cny, Currency.THB: thb_cny}
+
+            raise ValueError(f"不支持的基础币种: {base}")
+
+        except Exception as exc:
+            last_error = exc
+            if attempt < max_retries:
+                sleep_for = backoff * (2 ** (attempt - 1))
+                log.warning(
+                    "汇率接口第 %s/%s 次调用失败: %s，%.2fs 后重试",
+                    attempt,
+                    max_retries,
+                    exc,
+                    sleep_for,
+                )
+                time.sleep(sleep_for)
+
+    log.error(
+        "汇率接口连续 %s 次调用失败，将回退到本地模拟。最后错误: %s",
+        max_retries,
+        last_error,
+    )
+    return None
+
+
+def _today_rates_cache(db: Session, today: date) -> dict[Currency, Decimal]:
+    """
+    1) 先查数据库里今天已有的汇率；
+    2) 缺失的币种先尝试在线接口一次性批量拉取；
+    3) 在线失败 / 仍缺，就用 simulate_rate 本地兜底；
+    4) 所有新生成的汇率写回 DB（唯一约束防重），供同一请求内其它合同复用，避免重复调接口。
+    """
+    rows = db.scalars(
+        select(ExchangeRate).where(
+            ExchangeRate.rate_date == today,
+            ExchangeRate.currency.in_([Currency.USD, Currency.THB]),
+        )
+    ).all()
+    result: dict[Currency, Decimal] = {r.currency: r.rate_to_cny for r in rows}
+
+    missing = [c for c in (Currency.USD, Currency.THB) if c not in result]
+    if missing:
+        live = fetch_live_rates_via_http()
+        if live is not None:
+            for cur in missing:
+                if cur in live:
+                    result[cur] = live[cur]
+
+    still_missing = [c for c in (Currency.USD, Currency.THB) if c not in result]
+    if still_missing:
+        for cur in still_missing:
+            prev = db.scalars(
+                select(ExchangeRate)
+                .where(
+                    ExchangeRate.currency == cur,
+                    ExchangeRate.rate_date < today,
+                )
+                .order_by(ExchangeRate.rate_date.desc())
+            ).first()
+            prev_rate = prev.rate_to_cny if prev is not None else None
+            result[cur] = simulate_rate(cur, today, prev_rate)
+
+    for cur in (Currency.USD, Currency.THB):
+        if cur not in result:
+            continue
+        existing = db.scalars(
+            select(ExchangeRate).where(
+                ExchangeRate.currency == cur,
+                ExchangeRate.rate_date == today,
+            )
+        ).first()
+        if existing is None:
+            db.add(
+                ExchangeRate(
+                    currency=cur, rate_date=today, rate_to_cny=result[cur]
+                )
+            )
+    db.flush()
+    return result
+
+
 def get_or_create_today_rate(db: Session, currency: Currency) -> Decimal:
     today = date.today()
-    existing = db.scalars(
-        select(ExchangeRate).where(
-            ExchangeRate.currency == currency,
-            ExchangeRate.rate_date == today,
-        )
-    ).first()
-    if existing is not None:
-        return existing.rate_to_cny
-
-    prev = db.scalars(
-        select(ExchangeRate)
-        .where(
-            ExchangeRate.currency == currency,
-            ExchangeRate.rate_date < today,
-        )
-        .order_by(ExchangeRate.rate_date.desc())
-    ).first()
-    prev_rate = prev.rate_to_cny if prev is not None else None
-    rate = simulate_rate(currency, today, prev_rate)
-
-    db.add(ExchangeRate(currency=currency, rate_date=today, rate_to_cny=rate))
-    db.flush()
-    return rate
+    cache = _today_rates_cache(db, today)
+    return cache[currency]
 
 
 def list_rates(db: Session) -> list[ExchangeRate]:
